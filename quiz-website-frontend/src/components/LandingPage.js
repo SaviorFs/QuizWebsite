@@ -29,7 +29,6 @@ const LandingPage = () => {
     }
   };
 
-  // Handle Login
   const handleLogin = async (e) => {
     e.preventDefault();
     try {
