@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { db, auth } from '../firebase';
-import { doc, getDoc, updateDoc, arrayUnion } from 'firebase/firestore';
+import { doc, getDoc, updateDoc, deleteDoc, setDoc, arrayUnion } from 'firebase/firestore';
 import { useParams, useNavigate } from 'react-router-dom';
 
 const TakeQuiz = () => {
@@ -11,6 +11,10 @@ const TakeQuiz = () => {
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
   const [showResults, setShowResults] = useState(false);
   const [hasProgress, setHasProgress] = useState(false);
+  const [timerExpired, setTimerExpired] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [errorMessage, setErrorMessage] = useState('');
   const navigate = useNavigate();
 
   const loadQuizProgress = async () => {
@@ -23,6 +27,7 @@ const TakeQuiz = () => {
         const savedProgress = progressSnap.data();
         setUserAnswers(savedProgress.userAnswers);
         setCurrentQuestionIndex(savedProgress.currentQuestionIndex);
+        setTimeLeft(savedProgress.timeLeft || quiz.timeLimit);
         setHasProgress(true);
       } else {
         setHasProgress(false);
@@ -32,19 +37,22 @@ const TakeQuiz = () => {
 
   useEffect(() => {
     const fetchQuiz = async () => {
+      setLoading(true);
       const quizDocRef = doc(db, 'quizzes', id);
       const quizSnap = await getDoc(quizDocRef);
       if (quizSnap.exists()) {
         const quizData = quizSnap.data();
         if (quizData && quizData.questions && quizData.questions.length > 0) {
           setQuiz(quizData);
-          loadQuizProgress();
+          setTimeLeft(quizData.timeLimit);
+          await loadQuizProgress();
+          setLoading(false);
         } else {
-          alert("Quiz has no questions!");
+          setErrorMessage('Quiz has no questions!');
           navigate('/quizlist');
         }
       } else {
-        alert("Quiz not found!");
+        setErrorMessage('Quiz not found!');
         navigate('/quizlist');
       }
     };
@@ -52,31 +60,57 @@ const TakeQuiz = () => {
     fetchQuiz();
   }, [id, navigate]);
 
+  useEffect(() => {
+    let timer;
+    if (timeLeft > 0 && !showResults) {
+      timer = setInterval(() => {
+        setTimeLeft((prevTime) => prevTime - 1);
+      }, 1000);
+    } else if (timeLeft === 0) {
+      setTimerExpired(true);
+      handleSubmit();
+    }
+    return () => clearInterval(timer);
+  }, [timeLeft, showResults]);
+
   const startNewQuiz = () => {
     setUserAnswers(new Array(quiz.questions.length).fill(null));
     setCurrentQuestionIndex(0);
+    setTimeLeft(quiz.timeLimit);
     setHasProgress(false);
+    setTimerExpired(false);
+    setErrorMessage('');
+  };
+
+  const resumeQuiz = () => {
+    setCurrentQuestionIndex((prevIndex) => prevIndex);
+    setErrorMessage('');
   };
 
   const handleAnswerChange = (questionIndex, answerIndex) => {
     const updatedAnswers = [...userAnswers];
     updatedAnswers[questionIndex] = answerIndex;
     setUserAnswers(updatedAnswers);
+    setErrorMessage('');
   };
 
   const handleNextQuestion = () => {
     if (userAnswers[currentQuestionIndex] === null || userAnswers[currentQuestionIndex] === undefined) {
-      alert('Please select an answer before moving on.');
+      setErrorMessage('Please select an answer before moving on.');
       return;
     }
     setCurrentQuestionIndex((prevIndex) => prevIndex + 1);
   };
 
+  const handlePreviousQuestion = () => {
+    setCurrentQuestionIndex((prevIndex) => prevIndex - 1);
+  };
+
   const handleSubmit = async (e) => {
-    e.preventDefault();
+    if (e) e.preventDefault();
 
     if (userAnswers[currentQuestionIndex] === null || userAnswers[currentQuestionIndex] === undefined) {
-      alert('Please answer the last question before submitting.');
+      setErrorMessage('Please answer the last question before submitting.');
       return;
     }
 
@@ -90,6 +124,7 @@ const TakeQuiz = () => {
         userAnswer: question.options[userAnswers[index]],
         correctAnswer: question.options[question.correctAnswer],
         isCorrect,
+        explanation: question.explanation,
       };
     });
 
@@ -112,23 +147,47 @@ const TakeQuiz = () => {
     }
 
     const progressDocRef = doc(db, 'users', user.uid, 'quizProgress', id);
-    await updateDoc(progressDocRef, {});
+    const progressSnap = await getDoc(progressDocRef);
+
+    if (progressSnap.exists()) {
+      await deleteDoc(progressDocRef);
+    } else {
+      console.log('No progress document found, skipping deletion.');
+    }
   };
 
   const handlePause = async () => {
     const user = auth.currentUser;
     if (user) {
       const progressDocRef = doc(db, 'users', user.uid, 'quizProgress', id);
-      await updateDoc(progressDocRef, {
-        userAnswers,
-        currentQuestionIndex,
-        quizId: id,
-      });
+      const progressSnap = await getDoc(progressDocRef);
+
+      if (progressSnap.exists()) {
+        await updateDoc(progressDocRef, {
+          userAnswers,
+          currentQuestionIndex,
+          quizId: id,
+          timeLeft,
+        });
+      } else {
+        await setDoc(progressDocRef, {
+          userAnswers,
+          currentQuestionIndex,
+          quizId: id,
+          timeLeft,
+        });
+      }
     }
     navigate('/quizlist');
   };
 
-  if (!quiz) {
+  const formatTime = (seconds) => {
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return `${minutes}:${remainingSeconds < 10 ? '0' : ''}${remainingSeconds}`;
+  };
+
+  if (loading) {
     return <div>Loading quiz...</div>;
   }
 
@@ -136,10 +195,12 @@ const TakeQuiz = () => {
     <div>
       <h1>{quiz.title}</h1>
       <p>{quiz.description}</p>
+      <h3>Time Left: {formatTime(timeLeft)}</h3>
+      {errorMessage && <p style={{ color: 'red' }}>{errorMessage}</p>}
 
       {hasProgress && !showResults ? (
         <div>
-          <button onClick={loadQuizProgress}>Resume Quiz</button>
+          <button onClick={resumeQuiz}>Resume Quiz</button>
           <button onClick={startNewQuiz}>Start New Quiz</button>
         </div>
       ) : !showResults ? (
@@ -163,13 +224,20 @@ const TakeQuiz = () => {
                 </div>
               ))}
 
-              {currentQuestionIndex < quiz.questions.length - 1 ? (
-                <button type="button" onClick={handleNextQuestion}>
-                  Next Question
-                </button>
-              ) : (
-                <button type="submit">Submit Quiz</button>
-              )}
+              <div>
+                {currentQuestionIndex > 0 && (
+                  <button type="button" onClick={handlePreviousQuestion}>
+                    Previous Question
+                  </button>
+                )}
+                {currentQuestionIndex < quiz.questions.length - 1 ? (
+                  <button type="button" onClick={handleNextQuestion}>
+                    Next Question
+                  </button>
+                ) : (
+                  <button type="submit">Submit Quiz</button>
+                )}
+              </div>
             </div>
           )}
         </form>
@@ -187,6 +255,7 @@ const TakeQuiz = () => {
               ) : (
                 <p style={{ color: 'red' }}>Incorrect</p>
               )}
+              <p><strong>Explanation:</strong> {question.explanation || 'No explanation provided.'}</p>
             </div>
           ))}
 
